@@ -17,23 +17,29 @@
 package com.android.launcher3.qsb
 
 import android.app.SearchManager
+import android.app.role.RoleManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.Intent.ACTION_PACKAGE_ADDED
 import android.content.Intent.ACTION_PACKAGE_CHANGED
 import android.content.Intent.ACTION_PACKAGE_REMOVED
 import android.content.Intent.ACTION_SEARCH
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.LauncherApps
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.content.pm.PackageManager.NameNotFoundException
+import android.os.PatternMatcher
 import android.os.Process.myUserHandle
 import android.os.UserHandle
+import android.provider.Settings
 import android.util.Log
 import androidx.annotation.VisibleForTesting
 import androidx.annotation.WorkerThread
 import com.android.launcher3.R
+import com.android.launcher3.Utilities.GSA_PACKAGE
 import com.android.launcher3.dagger.ApplicationContext
 import com.android.launcher3.dagger.LauncherAppSingleton
 import com.android.launcher3.dagger.LauncherComponentProvider.appComponent
@@ -71,14 +77,63 @@ class OSEManager(
         SimpleBroadcastReceiver(context, executor) { reloadOse() }
     @VisibleForTesting var tracker: InstallSessionTracker? = null
 
-    private val defaultSearchPackage =
-        (context.getSystemService(SearchManager::class.java)?.globalSearchActivity?.packageName
-                ?: context.resources.getString(R.string.fallback_search_package_name))
-            .ifEmpty { null }
+    private fun isPackageInstalledAndEnabled(pkg: String?): Boolean {
+        if (pkg.isNullOrEmpty()) return false
+        return try {
+            val appInfo = context.getSystemService(LauncherApps::class.java)
+                ?.getApplicationInfo(pkg, PackageManager.MATCH_UNINSTALLED_PACKAGES, myUserHandle())
+            appInfo != null && appInfo.enabled
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun resolveDefaultSearchPackage(): String? {
+        // 1. Google App if installed & enabled
+        if (isPackageInstalledAndEnabled(GSA_PACKAGE)) {
+            return GSA_PACKAGE
+        }
+
+        // 2. Default Assistant (RoleManager or Settings.Secure.ASSISTANT)
+        try {
+            val roleManager = context.getSystemService(RoleManager::class.java)
+            val assistantRole = roleManager?.getRoleHolders(RoleManager.ROLE_ASSISTANT)?.firstOrNull()
+            if (!assistantRole.isNullOrEmpty() && isPackageInstalledAndEnabled(assistantRole)) {
+                return assistantRole
+            }
+        } catch (e: Exception) {
+            // Ignore
+        }
+
+        val assistantSetting = Settings.Secure.getString(context.contentResolver, Settings.Secure.ASSISTANT)
+        if (!assistantSetting.isNullOrEmpty()) {
+            val assistantPkg = ComponentName.unflattenFromString(assistantSetting)?.packageName
+            if (!assistantPkg.isNullOrEmpty() && isPackageInstalledAndEnabled(assistantPkg)) {
+                return assistantPkg
+            }
+        }
+
+        // 3. Fallback search package from resources if installed
+        val fallback = context.resources.getString(R.string.fallback_search_package_name).ifEmpty { null }
+        if (fallback != null && isPackageInstalledAndEnabled(fallback)) {
+            return fallback
+        }
+
+        // 4. Global search activity from SearchManager (e.g. Chrome, QuickSearchBox)
+        val globalSearch = context.getSystemService(SearchManager::class.java)?.globalSearchActivity?.packageName
+        if (!globalSearch.isNullOrEmpty() && isPackageInstalledAndEnabled(globalSearch)) {
+            return globalSearch
+        }
+
+        return fallback ?: globalSearch
+    }
+
+    private val defaultSearchPackage: String?
+        get() = resolveDefaultSearchPackage()
 
     /** Initialize with the current value to that there is no jump on reboot */
     private val mutableOSEInfoRef =
-        MutableListenableRef(OSEInfo(pkg = settingsObserver.getValue() ?: defaultSearchPackage))
+        MutableListenableRef(OSEInfo(pkg = settingsObserver.getValue() ?: resolveDefaultSearchPackage()))
 
     /**
      * Represents the current OSE Info and this should be used by consumers and listen to the value
@@ -116,12 +171,13 @@ class OSEManager(
                 installHelper.getActiveSessionInfo(myUserHandle(), oseSettingsValue) != null
             } ?: false
 
+        val defaultPkg = defaultSearchPackage
         // Check if package is being installed or is already installed
         val osePkg: String? =
             when {
                 oseApkInstalled || activeInstallSession -> oseSettingsValue
                 // No install session available, so fallback to defaultSearchPackage
-                isDefaultSearchPackageEnabled() -> defaultSearchPackage
+                isPackageInstalledAndEnabled(defaultPkg) -> defaultPkg
                 else -> null
             }
 
@@ -183,44 +239,30 @@ class OSEManager(
             )
         Log.i(TAG, "reloadOse oldOseInfo= $oldOseInfo\nnewOseInfo= $newOseInfo")
 
-        // Register for package changes for the target package
+        // Register for package changes for the target, GSA, and settings packages
         packageAvailableReceiver.close()
-        val targetPackage = osePkg ?: defaultSearchPackage
-        targetPackage?.listenForPackageChanges()
-
-        // Listen to the OseSettingValue package as well if it's installed little later or
-        // if the app gets archived/restored.
-        if (oseSettingsValue != targetPackage) oseSettingsValue?.listenForPackageChanges()
+        val targetPackage = osePkg ?: defaultPkg
+        listenForPackageChanges(targetPackage, GSA_PACKAGE, oseSettingsValue)
         if (oldOseInfo.isDifferentFrom(newOseInfo)) {
             mutableOSEInfoRef.dispatchValue(newOseInfo)
         }
     }
 
-    private fun String.listenForPackageChanges() =
-        packageAvailableReceiver.register(
-            packageFilter(
-                this,
-                ACTION_PACKAGE_ADDED,
-                ACTION_PACKAGE_CHANGED,
-                ACTION_PACKAGE_REMOVED,
-            )
-        )
+    private fun listenForPackageChanges(vararg packages: String?) {
+        val validPkgs = packages.filterNotNull().filter { it.isNotEmpty() }.distinct()
+        if (validPkgs.isEmpty()) return
+        val filter = IntentFilter().apply {
+            addAction(ACTION_PACKAGE_ADDED)
+            addAction(ACTION_PACKAGE_CHANGED)
+            addAction(ACTION_PACKAGE_REMOVED)
+            addDataScheme("package")
+            validPkgs.forEach { addDataSchemeSpecificPart(it, PatternMatcher.PATTERN_LITERAL) }
+        }
+        packageAvailableReceiver.register(filter)
+    }
 
     private fun isDefaultSearchPackageEnabled(): Boolean {
-        return try {
-            defaultSearchPackage?.let {
-                context
-                    .getSystemService(LauncherApps::class.java)
-                    ?.getApplicationInfo(
-                        it,
-                        PackageManager.MATCH_UNINSTALLED_PACKAGES,
-                        myUserHandle(),
-                    )
-                    ?.enabled
-            } ?: false
-        } catch (e: NameNotFoundException) {
-            false
-        }
+        return isPackageInstalledAndEnabled(defaultSearchPackage)
     }
 
     private fun unregisterInstallSessionTracker() {
