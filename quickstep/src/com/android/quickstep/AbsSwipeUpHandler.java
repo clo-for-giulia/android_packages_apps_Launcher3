@@ -432,7 +432,7 @@ public abstract class AbsSwipeUpHandler<
                     }
                     return mRecentsView.getPagedViewOrientedState().getRecentsActivityRotation();
                 }, inputConsumer, /* onTouchDownCallback = */ () -> {
-                    endRunningWindowAnim(mGestureState.getEndTarget() == HOME /* cancel */);
+                    endRunningWindowAnim(false /* cancel */);
                     endLauncherTransitionController();
                 }, new InputProxyHandlerFactory(mContainerInterface, mGestureState));
         mTaskAnimationManager = taskAnimationManager;
@@ -1965,16 +1965,13 @@ public abstract class AbsSwipeUpHandler<
                 if (mHandOffAnimationToHome) {
                     handOffAnimation(velocityPxPerMs);
                 }
-                windowAnim[0].addAnimatorListener(new AnimationSuccessListener() {
+                windowAnim[0].addAnimatorListener(new AnimatorListenerAdapter() {
                     @Override
-                    public void onAnimationSuccess(Animator animator) {
+                    public void onAnimationEnd(Animator animator) {
                         if (mRecentsAnimationController == null) {
-                            // If the recents animation is interrupted, we still end the running
-                            // animation (not canceled) so this is still called. In that case,
-                            // we can skip doing any future work here for the current gesture.
                             return;
                         }
-                        // Finalize the state and notify of the change
+                        // Finalize the state and notify of the change even if animation was interrupted/cancelled
                         mGestureState.setState(STATE_END_TARGET_ANIMATION_FINISHED);
                     }
                 });
@@ -2307,20 +2304,15 @@ public abstract class AbsSwipeUpHandler<
 
     @VisibleForTesting
     @NonNull
-    protected AnimationSuccessListener getWindowAnimationToHomeListener() {
-        return new AnimationSuccessListener() {
+    protected AnimatorListenerAdapter getWindowAnimationToHomeListener() {
+        return new AnimatorListenerAdapter() {
 
             @Override
             public void onAnimationEnd(Animator animation) {
-                super.onAnimationEnd(animation);
                 if (mRecentsView != null) {
                     final RECENTS_VIEW rv = mRecentsView;
                     rv.post(rv::resetTaskVisuals);
                 }
-            }
-
-            @Override
-            public void onAnimationSuccess(Animator animator) {
                 // Make sure recents is in its final state
                 maybeUpdateRecentsAttachedState(false);
                 mContainerInterface.onSwipeUpToHomeComplete();
